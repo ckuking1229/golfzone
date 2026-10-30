@@ -15,7 +15,13 @@
   S.forEach(s => { byId[s.id] = s; });
   const clubOf = id => CLUBS.find(c => c.id === id);
   const phaseNo = s => PHASES.findIndex(p => p.id === s.phase) + 1;
-  const phaseName = s => s.phaseKo || PHASES[phaseNo(s) - 1].ko;
+  // 퍼터는 백스트로크, 포워드 스트로크처럼 단계 이름이 달라요
+  function phaseNameOf(clubId, phaseId) {
+    const club = clubId && clubId !== 'all' ? clubOf(clubId) : null;
+    if (club && club.phaseKo && club.phaseKo[phaseId]) return club.phaseKo[phaseId];
+    return PHASES.find(p => p.id === phaseId).ko;
+  }
+  const phaseName = s => phaseNameOf(s.club, s.phase);
   const teeColor = club => 'var(--tee-' + club.marker + ')';
 
   // h('div', {class:'a', onclick: fn}, '글자', 자식요소) → 요소 만들기
@@ -56,19 +62,18 @@
   }
 
   /* ───────── 저장되는 상태 (이 기기, 이 브라우저에만 저장돼요) ───────── */
-  const KEY = 'golf-english-v1';
+  const KEY = 'golf-english-v2';
 
   function loadState() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
     const st = Object.assign({
-      startDate: L.todayStr(), done: {}, voiceURI: '', rate: 0.92, pitch: 0.85, hideEn: false, stats: {}
+      startDate: L.todayStr(), done: {}, known: {}, voiceURI: '', rate: 0.92, pitch: 0.85, hideEn: false, stats: {}
     }, saved);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(st.startDate) || L.dayNumberOf(st.startDate) < 1) st.startDate = L.todayStr();
     st.rate = clamp(Number(st.rate) || 0.92, 0.5, 1.4);
     st.pitch = clamp(Number(st.pitch) || 0.85, 0.5, 1.5);
-    if (!st.done || typeof st.done !== 'object') st.done = {};
-    if (!st.stats || typeof st.stats !== 'object') st.stats = {};
+    ['done', 'known', 'stats'].forEach(k => { if (!st[k] || typeof st[k] !== 'object') st[k] = {}; });
     st._fresh = !saved.startDate;
     return st;
   }
@@ -85,11 +90,15 @@
 
   const plan = L.buildPlan(S.map(s => s.id), D.PLAN_DAYS, D.PLAN_SEED);
   const currentDay = () => L.dayNumberOf(state.startDate);
-  const todayIndex = () => clamp(currentDay(), 1, D.PLAN_DAYS);
-  const todaySentence = () => byId[plan[todayIndex() - 1]];
 
-  const VIEWS = ['today', 'clubs', 'practice', 'sound'];
-  const ui = { view: 'today', viewDay: null, club: 'all', scope: 'today', mode: 'speak', pid: null, stamp: L.todayStr() };
+  // 클럽별 화면이 첫 화면이에요
+  const VIEWS = ['clubs', 'practice', 'today', 'sound'];
+  const ui = {
+    view: 'clubs',
+    club: 'driver', phase: 'all',          // 클럽별 화면의 선택
+    pClub: 'all', pPhase: 'all', mode: 'speak', pid: null,   // 연습 화면의 선택
+    viewDay: null, stamp: L.todayStr()
+  };
 
   /* ───────── 영어 음성 (미국 남성 목소리를 우선 고르기) ───────── */
   const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
@@ -228,145 +237,103 @@
     }, state.hideEn ? '영어 보이기' : '영어 가리기');
   }
 
+  function stepsEl(n) {
+    return h('span', { class: 'steps', 'aria-hidden': 'true' },
+      PHASES.map((p, i) => h('i', { class: i + 1 < n ? 'on' : (i + 1 === n ? 'now' : '') })));
+  }
+
   function metaRow(s) {
     const club = clubOf(s.club);
     const n = phaseNo(s);
     return h('div', { class: 'meta' },
       h('span', { class: 'club-tag' }, h('i', { class: 'dot', style: '--club:' + teeColor(club) }), club.ko),
-      h('span', { class: 'phase' },
-        h('span', { class: 'steps', 'aria-hidden': 'true' },
-          PHASES.map((p, i) => h('i', { class: i + 1 < n ? 'on' : (i + 1 === n ? 'now' : '') }))),
-        h('b', {}, n), phaseName(s)));
+      h('span', { class: 'phase' }, stepsEl(n), h('b', {}, n), phaseName(s)));
   }
 
-  /* ───────── 1. 오늘 ───────── */
-  function progressGrid(dn, viewDay) {
-    const cells = [];
-    for (let d = 1; d <= D.PLAN_DAYS; d++) {
-      const cls = ['cell'];
-      if (state.done[d]) cls.push('done');
-      if (d === dn) cls.push('today');
-      if (d === viewDay) cls.push('view');
-      cells.push(h('button', {
-        type: 'button', class: cls.join(' '), disabled: d > dn,
-        'aria-label': d + '일차' + (state.done[d] ? ' 완료' : ''),
-        'aria-current': d === viewDay ? 'true' : null,
-        onclick: () => { ui.viewDay = d; renderToday(); }
-      }));
-    }
-    return h('div', { class: 'grid80', role: 'group', 'aria-label': D.PLAN_DAYS + '일 진행표' }, cells);
+  const sitTitle = s => h('p', { class: 'sit-title' }, s.sit);
+
+  // '익혔어요' 표시: 날짜와 상관없이 내가 익힌 문장을 기억해 둬요
+  function knownBtn(s, onChange) {
+    const label = on => (on ? '✓ ' : '') + '익혔어요';
+    const on0 = !!state.known[s.id];
+    const btn = h('button', { type: 'button', class: 'btn known' + (on0 ? ' on' : ''), 'aria-pressed': String(on0) }, label(on0));
+    btn.addEventListener('click', () => {
+      if (state.known[s.id]) delete state.known[s.id]; else state.known[s.id] = true;
+      saveState();
+      const on = !!state.known[s.id];
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', String(on));
+      btn.textContent = label(on);
+      if (onChange) onChange();
+    });
+    return btn;
   }
 
-  function restartCourse() {
-    if (!window.confirm('오늘을 1일차로 해서 처음부터 다시 시작할까요? 지금까지의 완료 표시는 지워져요.')) return;
-    state.startDate = L.todayStr();
-    state.done = {};
-    ui.viewDay = null;
-    saveState();
-    renderToday();
-  }
+  const knownText = club => {
+    const all = S.filter(s => s.club === club.id);
+    return all.filter(s => state.known[s.id]).length + ' / ' + all.length + ' 익힘';
+  };
 
-  function renderToday() {
-    const root = $('#view-today');
-    root.replaceChildren();
-    const total = D.PLAN_DAYS;
-    const dn = currentDay();
-    const cap = Math.min(dn, total);
-    const view = ui.viewDay == null ? cap : clamp(ui.viewDay, 1, cap);
-    ui.viewDay = view;
-    const s = byId[plan[view - 1]];
-    const club = clubOf(s.club);
-    const doneCount = Object.keys(state.done).filter(k => state.done[k] && +k >= 1 && +k <= total).length;
-    const streak = L.streakOf(state.done, cap);
-
-    if (!synth) {
-      root.append(h('div', { class: 'banner warn' }, h('p', {}, '이 브라우저는 영어 음성을 지원하지 않아요. Chrome, Edge, Safari로 열어 주세요.')));
-    }
-    if (dn > total) {
-      root.append(h('div', { class: 'banner' },
-        h('p', {}, total + '일 코스를 마쳤어요. ' + doneCount + '일을 학습했어요.'),
-        h('button', { type: 'button', class: 'btn primary', onclick: restartCourse }, '오늘부터 다시 시작')));
-    }
-
-    const label = view === dn ? '오늘의 문장' : (dn > total && view === total ? '마지막 날 문장' : (dn - view) + '일 전 문장');
-
-    root.append(
-      h('div', { class: 'daybar' },
-        h('div', { class: 'daycount' },
-          h('span', { class: 'daynum' }, view),
-          h('span', { class: 'daytotal' }, '/ ' + total + '일'),
-          h('span', { class: 'daylabel' }, label)),
-        h('div', { class: 'daynav' },
-          h('button', { type: 'button', class: 'iconbtn', 'aria-label': '이전 날', disabled: view <= 1, onclick: () => { ui.viewDay = view - 1; renderToday(); } }, '‹'),
-          h('button', { type: 'button', class: 'iconbtn', 'aria-label': '다음 날', disabled: view >= cap, onclick: () => { ui.viewDay = view + 1; renderToday(); } }, '›'))),
-      progressGrid(dn, view),
-      h('p', { class: 'tally' },
-        h('span', {}, h('b', {}, doneCount), '일 완료'),
-        streak > 1 ? h('span', {}, h('b', {}, streak), '일 연속') : null),
-      h('section', { class: 'sheet', style: '--club:' + teeColor(club) },
-        metaRow(s),
-        h('p', { class: 'hint' }, '한국어 문장을 누르면 영어로 들려줘요.'),
-        sayButton(s),
+  /* ───────── 1. 클럽별 (첫 화면) ───────── */
+  function phaseGroup(club, phase, updateCount) {
+    const rows = S.filter(s => s.club === club.id && s.phase === phase.id);
+    const n = PHASES.indexOf(phase) + 1;
+    return h('div', { class: 'phase-group' },
+      h('div', { class: 'phase-band' },
+        h('b', {}, n), h('span', { class: 'phase-name' }, phaseNameOf(club.id, phase.id)), stepsEl(n),
+        h('span', { class: 'count' }, rows.length + '가지 상황')),
+      rows.map(s => h('article', { class: 'sit' },
+        h('h3', { class: 'sit-title' }, s.sit),
+        sayButton(s, { small: true }),
         enLine(s),
         h('div', { class: 'actions' },
           slowBtn(s),
-          hideBtn(),
+          knownBtn(s, updateCount),
           h('button', {
-            type: 'button', class: 'btn',
-            onclick: () => go('practice', { scope: view === dn ? 'today' : 'all', pid: s.id, mode: 'speak' })
-          }, '따라 말하기')),
-        h('button', {
-          type: 'button', class: 'btn done' + (state.done[view] ? ' on' : ''),
-          'aria-pressed': String(!!state.done[view]),
-          onclick: () => { state.done[view] = !state.done[view]; saveState(); renderToday(); }
-        }, (state.done[view] ? '✓ ' : '') + (view === dn ? '오늘 학습 완료' : view + '일차 학습 완료'))));
-  }
-
-  /* ───────── 2. 클럽별 ───────── */
-  function clubSheet(club) {
-    const rows = S.filter(s => s.club === club.id).sort((a, b) => phaseNo(a) - phaseNo(b));
-    return h('section', { class: 'card-sheet', style: '--club:' + teeColor(club) },
-      h('header', { class: 'sheet-head' },
-        h('i', { class: 'dot lg' }),
-        h('h2', {}, club.ko),
-        h('span', { class: 'en-name', lang: 'en' }, club.en)),
-      rows.map(s => h('article', { class: 'hole' },
-        h('div', { class: 'hole-no' }, h('b', {}, phaseNo(s)), h('span', {}, phaseName(s))),
-        h('div', { class: 'hole-body' },
-          sayButton(s, { small: true }),
-          enLine(s),
-          h('div', { class: 'actions tight' },
-            slowBtn(s),
-            h('button', {
-              type: 'button', class: 'btn ghost',
-              onclick: () => go('practice', { scope: s.club, pid: s.id, mode: 'speak' })
-            }, '연습'))))));
+            type: 'button', class: 'btn ghost',
+            onclick: () => go('practice', { pClub: s.club, pPhase: s.phase, pid: s.id, mode: 'speak' })
+          }, '연습')))));
   }
 
   function renderClubs() {
     const root = $('#view-clubs');
     root.replaceChildren();
-    const chip = (id, label, club) => h('button', {
-      type: 'button', class: 'chip', 'aria-pressed': String(ui.club === id),
-      onclick: () => { ui.club = id; renderClubs(); }
-    }, club ? h('i', { class: 'dot', style: '--club:' + teeColor(club) }) : null, label);
+    const club = clubOf(ui.club);
+    const phases = ui.phase === 'all' ? PHASES : PHASES.filter(p => p.id === ui.phase);
+
+    const clubChip = c => h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(ui.club === c.id),
+      onclick: () => { ui.club = c.id; renderClubs(); }
+    }, h('i', { class: 'dot', style: '--club:' + teeColor(c) }), c.ko);
+    const phaseChip = (id, label) => h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(ui.phase === id),
+      onclick: () => { ui.phase = id; renderClubs(); }
+    }, label);
+
+    const countEl = h('span', { class: 'club-progress' }, knownText(club));
+    const updateCount = () => { countEl.textContent = knownText(club); };
 
     root.append(
-      h('div', { class: 'chips', role: 'group', 'aria-label': '클럽 선택' },
-        chip('all', '전체'), CLUBS.map(c => chip(c.id, c.ko, c))),
+      h('div', { class: 'chips club-row', role: 'group', 'aria-label': '클럽 선택' }, CLUBS.map(clubChip)),
+      h('div', { class: 'chips', role: 'group', 'aria-label': '스윙 단계 선택' },
+        phaseChip('all', '전체 단계'), PHASES.map(p => phaseChip(p.id, phaseNameOf(club.id, p.id)))),
       h('div', { class: 'actions' }, hideBtn()),
-      ...(ui.club === 'all' ? CLUBS : [clubOf(ui.club)]).map(clubSheet));
+      h('section', { class: 'card-sheet', style: '--club:' + teeColor(club) },
+        h('header', { class: 'sheet-head' },
+          h('i', { class: 'dot lg' }),
+          h('h2', {}, club.ko),
+          h('span', { class: 'en-name', lang: 'en' }, club.en),
+          countEl),
+        phases.map(p => phaseGroup(club, p, updateCount))));
   }
 
-  /* ───────── 3. 연습 ───────── */
+  /* ───────── 2. 연습 ───────── */
   const freshQ = () => ({ result: null, error: '', listening: false, picked: new Set(), correct: false, hint: false, options: null, answer: '', reveal: false });
   let Q = freshQ();
   const session = { ok: 0, tries: 0 };
 
   function pool() {
-    if (ui.scope === 'today') return [todaySentence()];
-    if (ui.scope === 'all') return S;
-    return S.filter(s => s.club === ui.scope);
+    return S.filter(s => (ui.pClub === 'all' || s.club === ui.pClub) && (ui.pPhase === 'all' || s.phase === ui.pPhase));
   }
 
   function nextSentence() {
@@ -378,10 +345,10 @@
     renderPractice();
   }
 
-  function setScope(id) {
-    ui.scope = id;
-    if (id === 'today') ui.pid = todaySentence().id;
-    else if (!pool().some(s => s.id === ui.pid)) { ui.pid = null; nextSentence(); return; }
+  function setFilter(patch) {
+    stopAll();
+    Object.assign(ui, patch);
+    if (!pool().some(s => s.id === ui.pid)) { nextSentence(); return; }
     Q = freshQ();
     renderPractice();
   }
@@ -407,7 +374,7 @@
       r.heard ? h('p', { class: 'heard' }, '인식된 말: ' + r.heard) : null);
   }
 
-  /* 3-1. 따라 말하기 */
+  /* 2-1. 따라 말하기 */
   const SR_ERRORS = {
     'not-allowed': '마이크 사용이 막혀 있어요. 주소창 옆 자물쇠 아이콘에서 마이크를 허용해 주세요.',
     'service-not-allowed': '마이크 사용이 막혀 있어요. 주소창 옆 자물쇠 아이콘에서 마이크를 허용해 주세요.',
@@ -469,6 +436,7 @@
     const club = clubOf(s.club);
     return h('section', { class: 'sheet', style: '--club:' + teeColor(club) },
       metaRow(s),
+      sitTitle(s),
       sayButton(s),
       enLine(s),
       h('div', { class: 'actions' }, slowBtn(s), hideBtn()),
@@ -478,7 +446,7 @@
       statLine(s));
   }
 
-  /* 3-2. 빈칸 채우기 */
+  /* 2-2. 빈칸 채우기 */
   function pickOption(s, w) {
     if (Q.correct || Q.picked.has(w)) return;
     if (Q.picked.size === 0) { session.tries += 1; if (w === s.key.toLowerCase()) session.ok += 1; }
@@ -506,7 +474,8 @@
 
     return h('section', { class: 'sheet', style: '--club:' + teeColor(club) },
       metaRow(s),
-      h('p', { class: 'en-big', style: 'font-family:var(--font-body);font-weight:700' }, s.ko),
+      sitTitle(s),
+      h('p', { class: 'en-big ko-line' }, s.ko),
       h('p', { class: 'en-big cloze', lang: 'en' }, blank.before,
         Q.correct ? h('mark', {}, blank.answer) : h('span', { class: 'gap', 'aria-label': '빈칸' }),
         blank.after),
@@ -520,7 +489,7 @@
           }, (picked ? (w === key ? '✓ ' : '✕ ') : '') + fmt(w));
         })),
       Q.hint || Q.correct ? h('p', { class: 'note' }, '뜻: ' + s.key + ' = ' + s.keyKo) : null,
-      Q.correct ? h('p', { class: 'en', lang: 'en', style: 'filter:none' }, s.en) : null,
+      Q.correct ? h('p', { class: 'en shown', lang: 'en' }, s.en) : null,
       h('div', { class: 'actions' },
         !Q.correct ? h('button', { type: 'button', class: 'btn', onclick: () => { Q.hint = true; renderPractice(); } }, '뜻 힌트') : null,
         Q.correct ? h('button', { type: 'button', class: 'btn', onclick: () => playSentence(s) }, '다시 듣기') : null,
@@ -528,7 +497,7 @@
       session.tries ? h('p', { class: 'stat' }, '이번에 첫 번에 맞힌 문제 ' + session.ok + ' / ' + session.tries) : null);
   }
 
-  /* 3-3. 쓰기 */
+  /* 2-3. 쓰기 */
   function checkWrite(s) {
     if (!Q.answer.trim()) { toast('영어 문장을 입력해 주세요.'); return; }
     Q.result = L.scoreAnswer(s.en, Q.answer);
@@ -547,7 +516,8 @@
 
     return h('section', { class: 'sheet', style: '--club:' + teeColor(club) },
       metaRow(s),
-      h('p', { class: 'en-big', style: 'font-family:var(--font-body);font-weight:700' }, s.ko),
+      sitTitle(s),
+      h('p', { class: 'en-big ko-line' }, s.ko),
       ta,
       Q.hint ? h('p', { class: 'initials', lang: 'en' }, L.initialsHint(s.en)) : null,
       h('div', { class: 'actions' },
@@ -555,7 +525,7 @@
         h('button', { type: 'button', class: 'btn', onclick: () => { Q.hint = true; renderPractice(); } }, '첫 글자 힌트'),
         h('button', { type: 'button', class: 'btn', onclick: () => playSentence(s) }, '소리 힌트'),
         h('button', { type: 'button', class: 'btn ghost', onclick: () => { Q.reveal = true; renderPractice(); } }, '정답 보기')),
-      Q.reveal && !Q.result ? h('p', { class: 'en', lang: 'en', style: 'filter:none' }, s.en) : null,
+      Q.reveal && !Q.result ? h('p', { class: 'en shown', lang: 'en' }, s.en) : null,
       Q.result ? resultBlock(Q.result) : null,
       Q.result ? h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'btn', onclick: () => playSentence(s) }, '다시 듣기'),
@@ -566,12 +536,19 @@
   function renderPractice() {
     const root = $('#view-practice');
     root.replaceChildren();
-    if (!ui.pid || !byId[ui.pid]) ui.pid = todaySentence().id;
+    if (!ui.pid || !byId[ui.pid] || !pool().some(s => s.id === ui.pid)) {
+      const p = pool();
+      ui.pid = p[Math.floor(Math.random() * p.length)].id;
+      Q = freshQ();
+    }
     const s = byId[ui.pid];
 
-    const scopeChip = (id, label, club) => h('button', {
-      type: 'button', class: 'chip', 'aria-pressed': String(ui.scope === id), onclick: () => setScope(id)
+    const clubChip = (id, label, club) => h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(ui.pClub === id), onclick: () => setFilter({ pClub: id })
     }, club ? h('i', { class: 'dot', style: '--club:' + teeColor(club) }) : null, label);
+    const phaseChip = (id, label) => h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(ui.pPhase === id), onclick: () => setFilter({ pPhase: id })
+    }, label);
 
     const modes = [['speak', '따라 말하기'], ['blank', '빈칸 채우기'], ['write', '쓰기']];
     const seg = h('div', { class: 'seg', role: 'group', 'aria-label': '연습 방식' },
@@ -584,8 +561,10 @@
     const canNext = pool().length > 1;
 
     root.append(
-      h('div', { class: 'chips', role: 'group', 'aria-label': '연습할 문장 범위' },
-        scopeChip('today', '오늘 문장'), scopeChip('all', '전체'), CLUBS.map(c => scopeChip(c.id, c.ko, c))),
+      h('div', { class: 'chips', role: 'group', 'aria-label': '연습할 클럽' },
+        clubChip('all', '전체 클럽'), CLUBS.map(c => clubChip(c.id, c.ko, c))),
+      h('div', { class: 'chips', role: 'group', 'aria-label': '연습할 스윙 단계' },
+        phaseChip('all', '전체 단계'), PHASES.map(p => phaseChip(p.id, phaseNameOf(ui.pClub, p.id)))),
       seg,
       card,
       // append 에 null 을 넘기면 "null" 글자가 찍혀서, 없을 때는 빈 배열을 펼쳐요
@@ -594,13 +573,105 @@
         : []));
   }
 
+  /* ───────── 3. 오늘의 한 문장 (80일, 날짜 제한 없이 아무 날이나 열 수 있어요) ───────── */
+  function progressGrid(dn, viewDay) {
+    const cells = [];
+    for (let d = 1; d <= D.PLAN_DAYS; d++) {
+      const cls = ['cell'];
+      if (state.done[d]) cls.push('done');
+      if (d === dn) cls.push('today');
+      if (d === viewDay) cls.push('view');
+      cells.push(h('button', {
+        type: 'button', class: cls.join(' '),
+        'aria-label': d + '일차' + (d === dn ? ' (오늘)' : '') + (state.done[d] ? ' 완료' : ''),
+        'aria-current': d === viewDay ? 'true' : null,
+        onclick: () => { ui.viewDay = d; renderToday(); }
+      }));
+    }
+    return h('div', { class: 'grid80', role: 'group', 'aria-label': D.PLAN_DAYS + '일 진행표' }, cells);
+  }
+
+  function restartCourse() {
+    if (!window.confirm('오늘을 1일차로 해서 처음부터 다시 시작할까요? 일차별 완료 표시는 지워져요.')) return;
+    state.startDate = L.todayStr();
+    state.done = {};
+    ui.viewDay = null;
+    saveState();
+    renderToday();
+  }
+
+  function renderToday() {
+    const root = $('#view-today');
+    root.replaceChildren();
+    const total = D.PLAN_DAYS;
+    const dn = currentDay();
+    const todayCell = Math.min(dn, total);
+    const view = clamp(ui.viewDay == null ? todayCell : ui.viewDay, 1, total);
+    ui.viewDay = view;
+    const s = byId[plan[view - 1]];
+    const club = clubOf(s.club);
+    const doneCount = Object.keys(state.done).filter(k => state.done[k] && +k >= 1 && +k <= total).length;
+    const streak = L.streakOf(state.done, todayCell);
+
+    if (!synth) {
+      root.append(h('div', { class: 'banner warn' }, h('p', {}, '이 브라우저는 영어 음성을 지원하지 않아요. Chrome, Edge, Safari로 열어 주세요.')));
+    }
+    if (dn > total) {
+      root.append(h('div', { class: 'banner' },
+        h('p', {}, total + '일 코스를 마쳤어요. ' + doneCount + '일을 학습했어요.'),
+        h('button', { type: 'button', class: 'btn primary', onclick: restartCourse }, '오늘부터 다시 시작')));
+    }
+
+    const label = view === dn ? '오늘의 문장'
+      : (dn > total && view === total ? '마지막 날 문장'
+        : (view < dn ? (dn - view) + '일 전 문장' : (view - dn) + '일 뒤 문장'));
+
+    root.append(
+      h('div', { class: 'daybar' },
+        h('div', { class: 'daycount' },
+          h('span', { class: 'daynum' }, view),
+          h('span', { class: 'daytotal' }, '/ ' + total + '일'),
+          h('span', { class: 'daylabel' }, label)),
+        h('div', { class: 'daynav' },
+          h('button', { type: 'button', class: 'iconbtn', 'aria-label': '이전 날', disabled: view <= 1, onclick: () => { ui.viewDay = view - 1; renderToday(); } }, '‹'),
+          h('button', { type: 'button', class: 'iconbtn', 'aria-label': '다음 날', disabled: view >= total, onclick: () => { ui.viewDay = view + 1; renderToday(); } }, '›'))),
+      progressGrid(dn, view),
+      h('p', { class: 'hint' }, '날짜와 상관없이 아무 날이나 눌러서 공부할 수 있어요.'),
+      h('div', { class: 'tally-row' },
+        h('p', { class: 'tally' },
+          h('span', {}, h('b', {}, doneCount), '일 완료'),
+          streak > 1 ? h('span', {}, h('b', {}, streak), '일 연속') : null),
+        view !== todayCell ? h('button', { type: 'button', class: 'btn ghost', onclick: () => { ui.viewDay = todayCell; renderToday(); } }, '오늘로') : null),
+      h('section', { class: 'sheet', style: '--club:' + teeColor(club) },
+        metaRow(s),
+        sitTitle(s),
+        sayButton(s),
+        enLine(s),
+        h('div', { class: 'actions' },
+          slowBtn(s),
+          hideBtn(),
+          h('button', {
+            type: 'button', class: 'btn',
+            onclick: () => go('practice', { pClub: 'all', pPhase: 'all', pid: s.id, mode: 'speak' })
+          }, '따라 말하기'),
+          h('button', {
+            type: 'button', class: 'btn ghost',
+            onclick: () => go('clubs', { club: s.club, phase: s.phase })
+          }, '같은 상황 더 보기')),
+        h('button', {
+          type: 'button', class: 'btn done' + (state.done[view] ? ' on' : ''),
+          'aria-pressed': String(!!state.done[view]),
+          onclick: () => { state.done[view] = !state.done[view]; saveState(); renderToday(); }
+        }, (state.done[view] ? '✓ ' : '') + (view === dn ? '오늘 학습 완료' : view + '일차 학습 완료'))));
+  }
+
   /* ───────── 4. 소리와 설정 ───────── */
   function renderSound() {
     const root = $('#view-sound');
     root.replaceChildren();
     refreshVoices();
 
-    const sample = S[2];
+    const sample = byId['driver-downswing-3'] || S[0];
     const rateVal = h('span', { class: 'val' }, state.rate.toFixed(2));
     const pitchVal = h('span', { class: 'val' }, state.pitch.toFixed(2));
 
@@ -646,15 +717,15 @@
           h('button', { type: 'button', class: 'btn', onclick: () => { state.voiceURI = ''; state.rate = 0.92; state.pitch = 0.85; saveState(); renderSound(); } }, '추천 설정으로 되돌리기')),
         h('p', { class: 'note' }, '목소리는 기기에 들어 있는 음성으로 재생돼요. Windows와 Edge에서는 Microsoft Davis나 Guy, 아이폰과 맥에서는 Evan이나 Alex 같은 미국 남성 음성이 잘 어울려요. 높낮이를 낮추면 더 묵직하게 들려요.')),
       h('section', { class: 'group' },
-        h('h2', {}, '80일 코스'),
+        h('h2', {}, '오늘의 한 문장 (80일)'),
         h('div', { class: 'field' }, h('label', { for: 'start' }, '시작일'), date),
-        h('p', { class: 'note' }, '문장 순서는 누구에게나 같아요. 함께 공부하는 사람과 같은 날 시작하려면 시작일을 똑같이 맞춰 주세요. 학습 기록은 각자의 기기에만 저장돼요.'),
+        h('p', { class: 'note' }, '80일 동안 하루에 한 문장씩, 80문장이 한 번씩 나와요. 날짜와 상관없이 어느 날이든 열어서 공부할 수 있어요. 문장 순서는 누구에게나 같으니, 함께 공부하는 사람과 시작일을 맞춰 두면 같은 날 같은 문장을 보게 돼요. 학습 기록은 각자의 기기에만 저장돼요.'),
         h('label', { class: 'check' }, hideCheck, '영어 문장을 기본으로 가리기 (눌러서 확인)'),
         h('button', {
           type: 'button', class: 'btn danger',
           onclick: () => {
-            if (!window.confirm('완료 표시와 연습 기록을 모두 지울까요?')) return;
-            state.done = {}; state.stats = {}; saveState(); toast('기록을 지웠어요.');
+            if (!window.confirm('익힘 표시, 완료 표시, 연습 기록을 모두 지울까요?')) return;
+            state.done = {}; state.known = {}; state.stats = {}; saveState(); toast('기록을 지웠어요.');
           }
         }, '학습 기록 지우기')));
   }
@@ -667,7 +738,7 @@
     document.querySelectorAll('.tab').forEach(b => {
       if (b.dataset.view === ui.view) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
     });
-    ({ today: renderToday, clubs: renderClubs, practice: renderPractice, sound: renderSound })[ui.view]();
+    ({ clubs: renderClubs, practice: renderPractice, today: renderToday, sound: renderSound })[ui.view]();
   }
 
   function go(view, patch) {
@@ -696,6 +767,6 @@
   }
 
   const first = location.hash.replace('#', '');
-  ui.view = VIEWS.indexOf(first) >= 0 ? first : 'today';
+  ui.view = VIEWS.indexOf(first) >= 0 ? first : 'clubs';
   render();
 })();
