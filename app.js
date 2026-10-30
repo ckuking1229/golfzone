@@ -68,8 +68,10 @@
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
     const st = Object.assign({
-      startDate: L.todayStr(), done: {}, known: {}, voiceURI: '', rate: 0.92, pitch: 0.85, hideEn: false, stats: {}
+      startDate: L.todayStr(), done: {}, known: {}, voiceURI: '', rate: 0.92, pitch: 0.85, hideEn: false, stats: {},
+      voiceMode: 'recorded'
     }, saved);
+    if (st.voiceMode !== 'device') st.voiceMode = 'recorded';
     if (!/^\d{4}-\d{2}-\d{2}$/.test(st.startDate) || L.dayNumberOf(st.startDate) < 1) st.startDate = L.todayStr();
     st.rate = clamp(Number(st.rate) || 0.92, 0.5, 1.4);
     st.pitch = clamp(Number(st.pitch) || 0.85, 0.5, 1.5);
@@ -136,9 +138,12 @@
 
   let playToken = 0;
   let playingBtn = null;
-  let audioEl = null;
   let utterance = null;     // 브라우저가 재생 중에 지워 버리지 않도록 붙잡아 둬요
   let recognizer = null;
+
+  // 소리 화면의 "지금 상태" 문구를 갱신하는 함수 (소리 화면이 열려 있을 때만 있어요)
+  let onReport = null;
+  const report = msg => { if (onReport) onReport(msg); };
 
   function setPlaying(btn) {
     if (playingBtn) playingBtn.classList.remove('is-playing');
@@ -146,61 +151,108 @@
     if (btn) btn.classList.add('is-playing');
   }
 
+  /* 소리는 두 길이 있어요.
+     1) 미리 녹음한 mp3 (audio/<id>.mp3, 느리게는 <id>-slow.mp3). 모든 폰에서 같은 미국 남성 목소리가 나요.
+        브라우저에 따라 소리가 안 나는 기기 음성(speechSynthesis)에 기대지 않으려고 이쪽을 먼저 써요.
+     2) 기기 음성. 녹음 파일을 못 받았거나 소리 화면에서 직접 골랐을 때만 써요. */
+  const player = new Audio();       // 하나를 계속 재사용해요
+  player.preload = 'auto';
+  player.setAttribute('playsinline', '');
+  let current = null;               // 녹음 파일 재생 요청 하나 { fell, timer, fallback }
+
   function stopAudio() {
     playToken++;
+    if (current) { clearTimeout(current.timer); current = null; }
+    try { player.pause(); } catch (e) { /* 무시 */ }
     if (synth && (synth.speaking || synth.pending)) synth.cancel();
-    if (audioEl) { try { audioEl.pause(); } catch (e) { /* 무시 */ } audioEl = null; }
     setPlaying(null);
   }
+
+  player.addEventListener('playing', () => {
+    if (!current) return;
+    clearTimeout(current.timer);
+    report('녹음 음성을 재생하고 있어요. 소리가 안 들리면 아래 순서로 확인해 보세요.');
+  });
+  player.addEventListener('ended', () => { if (current && !current.fell) setPlaying(null); });
+  player.addEventListener('error', () => { if (current) current.fallback('missing'); });
 
   function speakText(text, o) {
     o = o || {};
     if (!synth) {
-      toast('이 브라우저는 영어 음성 재생을 지원하지 않아요. Chrome, Edge, Safari에서 열어 주세요.');
+      report('이 브라우저는 기기 음성을 지원하지 않아요. Chrome이나 Safari에서 열어 주세요.');
+      toast('이 브라우저는 영어 음성 재생을 지원하지 않아요. Chrome, Safari에서 열어 주세요.');
       return;
     }
     const wasBusy = synth.speaking || synth.pending;
     stopAudio();
     const token = playToken;
     setPlaying(o.btn);
+    report('기기 음성으로 읽고 있어요.');
     const run = () => {
       if (token !== playToken) return;
-      const u = new SpeechSynthesisUtterance(text);
-      if (activeVoice) { u.voice = activeVoice; u.lang = activeVoice.lang; } else { u.lang = 'en-US'; }
-      u.rate = clamp(state.rate * (o.slow ? 0.72 : 1), 0.4, 1.6);
-      u.pitch = state.pitch;
-      const end = () => { if (token === playToken) setPlaying(null); };
-      u.onend = end;
-      u.onerror = end;
-      utterance = u;
-      synth.speak(u);
+      const say = useVoice => {
+        const u = new SpeechSynthesisUtterance(text);
+        if (useVoice && activeVoice) { u.voice = activeVoice; u.lang = activeVoice.lang; } else { u.lang = 'en-US'; }
+        u.rate = clamp(state.rate * (o.slow ? 0.72 : 1), 0.4, 1.6);
+        u.pitch = state.pitch;
+        let started = false;
+        const end = () => { if (u === utterance && token === playToken) setPlaying(null); };
+        u.onstart = () => { started = true; };
+        u.onend = end;
+        u.onerror = end;
+        utterance = u;
+        if (synth.paused) synth.resume();
+        synth.speak(u);
+        // 일부 안드로이드 폰은 고른 음성이 조용히 멈춰요: 시작이 안 되면 기본 음성으로 한 번 더 해요
+        if (useVoice && activeVoice) {
+          setTimeout(() => {
+            if (token !== playToken || started || u !== utterance) return;
+            synth.cancel();
+            say(false);
+          }, 1800);
+        }
+      };
+      say(true);
     };
     if (wasBusy) setTimeout(run, 70); else run();
   }
 
-  // audio/<id>.mp3 가 있으면 녹음 파일을 먼저 재생하고, 없으면 기기 음성으로 읽어요
+  function playRecorded(s, o) {
+    stopAudio();
+    const token = playToken;
+    setPlaying(o.btn);
+    const req = { fell: false, timer: 0 };
+    req.fallback = why => {
+      if (current !== req || req.fell || token !== playToken) return;
+      req.fell = true;
+      clearTimeout(req.timer);
+      if (why === 'blocked') {
+        report('브라우저가 소리 재생을 막았어요. 화면을 한 번 누른 뒤 다시 눌러 보세요. 지금은 기기 음성으로 대신 읽어요.');
+        toast('소리가 막혔어요. 한 번 더 눌러 주세요.');
+      } else {
+        report('녹음 파일을 불러오지 못했어요. 인터넷 연결을 확인해 주세요. 지금은 기기 음성으로 대신 읽어요.');
+      }
+      current = null;
+      speakText(s.en, o);
+    };
+    current = req;
+    // 파일을 받는 데 오래 걸리면 기다리지 않고 기기 음성으로 넘어가요
+    req.timer = setTimeout(() => req.fallback('slow'), 7000);
+    player.src = 'audio/' + s.id + (o.slow ? '-slow' : '') + '.mp3';
+    const p = player.play();            // 반드시 누른 바로 그 순간에 불러야 아이폰에서 소리가 나요
+    if (p && p.catch) {
+      p.catch(err => {
+        if (err && err.name === 'AbortError') return;      // 바로 다른 문장을 눌러서 끊긴 경우
+        req.fallback(err && err.name === 'NotAllowedError' ? 'blocked' : 'failed');
+      });
+    }
+  }
+
+  // 문장 재생: 녹음 파일을 먼저 쓰고, 안 되면 기기 음성으로 읽어요
   function playSentence(s, o) {
     o = o || {};
-    if (D.USE_RECORDED_AUDIO) {
-      stopAudio();
-      const token = playToken;
-      const a = new Audio('audio/' + s.id + '.mp3');
-      audioEl = a;
-      a.playbackRate = o.slow ? 0.75 : 1;
-      let fell = false;
-      const fallback = () => {
-        if (fell || token !== playToken) return;
-        fell = true; audioEl = null;
-        speakText(s.en, o);
-      };
-      a.addEventListener('error', fallback);
-      a.addEventListener('ended', () => { if (token === playToken) setPlaying(null); });
-      setPlaying(o.btn);
-      const p = a.play();
-      if (p && p.catch) p.catch(fallback);
-      return;
-    }
-    speakText(s.en, o);
+    if (D.USE_RECORDED_AUDIO && state.voiceMode !== 'device') playRecorded(s, o);
+    else speakText(s.en, o);
   }
 
   function stopListening() {
@@ -666,12 +718,23 @@
   }
 
   /* ───────── 4. 소리와 설정 ───────── */
+  function cachedAudioCount() {
+    if (!('caches' in window)) return Promise.resolve(-1);
+    // sw.js 의 AUDIO_CACHE 이름 끝 숫자를 올려도 세어지도록 golf-audio- 로 시작하는 저장소를 모두 봐요
+    return caches.keys()
+      .then(names => Promise.all(names.filter(n => n.indexOf('golf-audio-') === 0)
+        .map(n => caches.open(n).then(c => c.keys()).then(k => k.length))))
+      .then(counts => counts.length ? Math.max.apply(null, counts) : 0)
+      .catch(() => -1);
+  }
+
   function renderSound() {
     const root = $('#view-sound');
     root.replaceChildren();
     refreshVoices();
 
     const sample = byId['driver-downswing-3'] || S[0];
+    const device = state.voiceMode === 'device';
     const rateVal = h('span', { class: 'val' }, state.rate.toFixed(2));
     const pitchVal = h('span', { class: 'val' }, state.pitch.toFixed(2));
 
@@ -692,6 +755,11 @@
       playSentence(sample);
     });
 
+    const mode = h('select', { id: 'voicemode' },
+      h('option', { value: 'recorded', selected: !device }, '녹음 음성 (추천)'),
+      h('option', { value: 'device', selected: device }, '기기 음성'));
+    mode.addEventListener('change', () => { state.voiceMode = mode.value; saveState(); renderSound(); });
+
     const date = h('input', { type: 'date', id: 'start', value: state.startDate, max: L.todayStr() });
     date.addEventListener('change', () => {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date.value) || L.dayNumberOf(date.value) < 1) { date.value = state.startDate; return; }
@@ -704,18 +772,48 @@
     const hideCheck = h('input', { type: 'checkbox', id: 'hide', checked: state.hideEn });
     hideCheck.addEventListener('change', () => { state.hideEn = hideCheck.checked; saveState(); document.body.dataset.hideEn = state.hideEn ? '1' : '0'; });
 
+    const status = h('p', { class: 'status', id: 'sound-status', role: 'status', 'aria-live': 'polite' },
+      '버튼을 누르면 예시 문장이 재생돼요.');
+    onReport = msg => { status.textContent = msg; };
+
+    const offline = h('p', { class: 'note', id: 'offline-note' }, '');
+    // 저장이 끝날 때까지 몇 초마다 다시 세어서 보여줘요
+    const refreshOffline = tries => cachedAudioCount().then(n => {
+      if (n < 0) { offline.textContent = '이 브라우저에서는 인터넷 없이 듣기를 쓸 수 없어요.'; return; }
+      const got = Math.min(n, S.length);
+      offline.textContent = got >= S.length
+        ? '인터넷 없이도 들을 수 있게 음성 ' + S.length + '개를 이 폰에 저장해 뒀어요.'
+        : '인터넷 없이 듣도록 음성을 저장하는 중이에요. (' + got + '/' + S.length + ') 인터넷이 되는 곳에서 앱을 열어 두면 채워져요.';
+      if (got < S.length && tries > 0 && offline.isConnected) setTimeout(() => refreshOffline(tries - 1), 1500);
+    });
+    refreshOffline(20);
+
     root.append(
       h('section', { class: 'group' },
-        h('h2', {}, '영어 목소리'),
-        voices.length
-          ? h('div', { class: 'field' }, h('label', { for: 'voice' }, '목소리'), select)
-          : h('p', { class: 'note' }, synth ? '이 기기에서 쓸 수 있는 영어 목소리를 찾지 못했어요. 잠시 뒤 다시 열어 보거나 기기의 음성(TTS) 설정에서 영어 음성을 설치해 주세요.' : '이 브라우저는 영어 음성을 지원하지 않아요.'),
-        h('div', { class: 'field' }, h('div', { class: 'lab' }, h('label', { for: 'rate' }, '말하기 속도'), rateVal), rate),
-        h('div', { class: 'field' }, h('div', { class: 'lab' }, h('label', { for: 'pitch' }, '목소리 높낮이'), pitchVal), pitch),
+        h('h2', {}, '소리 확인'),
+        h('p', { class: 'note' }, '폰에서 소리가 안 나면 여기서 확인해 보세요.'),
         h('div', { class: 'actions' },
-          h('button', { type: 'button', class: 'btn primary', onclick: () => playSentence(sample) }, '시험 재생'),
-          h('button', { type: 'button', class: 'btn', onclick: () => { state.voiceURI = ''; state.rate = 0.92; state.pitch = 0.85; saveState(); renderSound(); } }, '추천 설정으로 되돌리기')),
-        h('p', { class: 'note' }, '목소리는 기기에 들어 있는 음성으로 재생돼요. Windows와 Edge에서는 Microsoft Davis나 Guy, 아이폰과 맥에서는 Evan이나 Alex 같은 미국 남성 음성이 잘 어울려요. 높낮이를 낮추면 더 묵직하게 들려요.')),
+          h('button', { type: 'button', class: 'btn primary', id: 'sound-test', onclick: e => playSentence(sample, { btn: e.currentTarget }) }, '소리 들어보기')),
+        status,
+        h('ol', { class: 'checklist' },
+          h('li', {}, '폰의 미디어 볼륨을 올려 주세요. (소리 크기 버튼을 누르고 미디어 볼륨을 확인해요)'),
+          h('li', {}, '아이폰은 옆면 무음 스위치를 확인해 주세요. 주황색이 보이면 무음이에요.'),
+          h('li', {}, '카카오톡, 네이버 같은 앱 안에서 열었다면 오른쪽 위 메뉴에서 다른 브라우저(Safari, Chrome)로 열어 주세요.'),
+          h('li', {}, '블루투스 이어폰이나 스피커가 연결돼 있으면 거기서 소리가 날 수 있어요.')),
+        offline),
+      h('section', { class: 'group' },
+        h('h2', {}, '영어 목소리'),
+        h('div', { class: 'field' }, h('label', { for: 'voicemode' }, '재생 방식'), mode),
+        device ? [
+          voices.length
+            ? h('div', { class: 'field' }, h('label', { for: 'voice' }, '목소리'), select)
+            : h('p', { class: 'note' }, synth ? '이 기기에서 쓸 수 있는 영어 목소리를 찾지 못했어요. 잠시 뒤 다시 열어 보거나 기기의 음성(TTS) 설정에서 영어 음성을 설치해 주세요.' : '이 브라우저는 기기 음성을 지원하지 않아요.'),
+          h('div', { class: 'field' }, h('div', { class: 'lab' }, h('label', { for: 'rate' }, '말하기 속도'), rateVal), rate),
+          h('div', { class: 'field' }, h('div', { class: 'lab' }, h('label', { for: 'pitch' }, '목소리 높낮이'), pitchVal), pitch),
+          h('p', { class: 'note' }, '기기 음성은 폰마다 목소리가 달라요. Windows와 Edge에서는 Microsoft Davis나 Guy, 아이폰과 맥에서는 Evan이나 Alex 같은 미국 남성 음성이 잘 어울려요. 높낮이를 낮추면 더 묵직하게 들려요.')
+        ] : h('p', { class: 'note' }, '미리 녹음한 미국 남성 목소리예요. 문장마다 보통 속도와 느린 속도 파일이 있어서, 어떤 폰으로 열어도 똑같이 들려요. 파일을 받지 못하면 폰의 기기 음성으로 대신 읽어요.'),
+        h('div', { class: 'actions' },
+          h('button', { type: 'button', class: 'btn', onclick: () => { state.voiceURI = ''; state.rate = 0.92; state.pitch = 0.85; state.voiceMode = 'recorded'; saveState(); renderSound(); } }, '추천 설정으로 되돌리기'))),
       h('section', { class: 'group' },
         h('h2', {}, '오늘의 한 문장 (80일)'),
         h('div', { class: 'field' }, h('label', { for: 'start' }, '시작일'), date),
@@ -733,6 +831,7 @@
   /* ───────── 화면 전환 ───────── */
   function render() {
     stopAll();
+    onReport = null;
     document.body.dataset.hideEn = state.hideEn ? '1' : '0';
     VIEWS.forEach(v => { $('#view-' + v).hidden = v !== ui.view; });
     document.querySelectorAll('.tab').forEach(b => {
@@ -766,7 +865,39 @@
     else synth.onvoiceschanged = onVoices;
   }
 
+  /* 카카오톡, 네이버, 인스타그램 같은 앱 안의 브라우저에서는 마이크가 막히고 기기 음성이 안 나는 일이 많아요 */
+  const IN_APP = /KAKAOTALK|NAVER\(inapp|Instagram|FBAN|FBAV|FB_IAB|Line\/|DaumApps|Twitter|; wv\)/i.test(navigator.userAgent || '');
+  function showAppNotice() {
+    let dismissed = false;
+    try { dismissed = sessionStorage.getItem('golf-notice-off') === '1'; } catch (e) { /* 무시 */ }
+    if (!IN_APP || dismissed) return;
+    const box = h('div', { class: 'banner warn', role: 'note', id: 'app-notice' },
+      h('p', {}, '지금 다른 앱 안에서 열었어요. 영어 듣기는 되지만 마이크 연습은 안 될 수 있어요. 오른쪽 위 메뉴에서 ',
+        h('b', {}, '다른 브라우저로 열기'), '를 눌러 Chrome이나 Safari에서 열어 주세요.'),
+      h('button', {
+        type: 'button', class: 'btn ghost',
+        onclick: () => { try { sessionStorage.setItem('golf-notice-off', '1'); } catch (e) { /* 무시 */ } box.remove(); }
+      }, '닫기'));
+    $('#app').before(box);
+  }
+
+  /* 한 번 열어 두면 음성 파일을 폰에 저장해서, 골프장처럼 신호가 약한 곳에서도 들려요 */
+  function setupOffline() {
+    if (!('serviceWorker' in navigator)) return;
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') return;
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).then(reg => {
+        const c = navigator.connection;
+        if (c && c.saveData) return;
+        const urls = S.map(s => 'audio/' + s.id + '.mp3');
+        if (reg.active) reg.active.postMessage({ type: 'precache-audio', urls });
+      }).catch(() => { /* 저장 기능이 없어도 앱은 그대로 써요 */ });
+    });
+  }
+
   const first = location.hash.replace('#', '');
   ui.view = VIEWS.indexOf(first) >= 0 ? first : 'clubs';
   render();
+  showAppNotice();
+  setupOffline();
 })();

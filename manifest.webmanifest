@@ -1,0 +1,16 @@
+{
+  "name": "골프 레슨 영어",
+  "short_name": "골프영어",
+  "description": "클럽별 레슨 상황 영어 문장을 한국어 버튼으로 듣고 연습해요.",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f2d22",
+  "theme_color": "#0f2d22",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

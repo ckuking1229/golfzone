@@ -45,6 +45,9 @@ body {
 
 button, select, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+button, select, input, .tab { touch-action: manipulation; }   /* 두 번 눌러 확대되거나 눌림이 늦는 일을 막아요 */
+select, input, textarea { font-size: 16px; }                    /* 아이폰이 입력칸을 눌렀을 때 화면을 확대하지 않게 */
+.top { padding-top: env(safe-area-inset-top); }
 h2, h3, p { margin: 0; }
 
 :focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
@@ -319,6 +322,10 @@ select, input[type="date"] {
 input[type="range"] { width: 100%; accent-color: var(--turf-700); min-height: 32px; }
 .check { display: flex; align-items: center; gap: 12px; min-height: 44px; font-weight: 500; }
 .check input { width: 22px; height: 22px; accent-color: var(--turf-700); }
+
+.status { padding: 12px 14px; border-radius: 10px; background: var(--turf-100); font-weight: 600; font-size: 15px; }
+.checklist { margin: 0; padding-left: 22px; display: grid; gap: 8px; font-size: 15px; color: var(--ink-soft); }
+#app-notice { width: calc(100% - 32px); max-width: 648px; margin: 12px auto 0; font-size: 15px; }
 
 /* ───────── 알림 ───────── */
 .toast {

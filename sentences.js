@@ -272,7 +272,7 @@
     SENTENCES: SENTENCES,
     PLAN_DAYS: 80,                    // '오늘의 한 문장' 코스 길이(일). 문장이 80개라 하루에 하나씩 한 번씩 나와요
     PLAN_SEED: 'golf-english-80-v2',  // 같은 값이면 누구의 폰에서나 같은 순서로 나와요
-    USE_RECORDED_AUDIO: false         // true로 바꾸고 audio/<id>.mp3 를 넣으면 녹음 파일을 먼저 재생해요
+    USE_RECORDED_AUDIO: true          // audio/<id>.mp3 (느리게는 <id>-slow.mp3) 녹음 파일을 먼저 재생해요. false면 기기 음성만 써요
   };
 
   if (typeof module === 'object' && module.exports) module.exports = data;
